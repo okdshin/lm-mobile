@@ -1,426 +1,205 @@
-#include <cassert>
-#include <iostream>
-#include <llama.cpp>
-#include <memory>
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/spdlog.h>
-#include <vector>
-
-namespace {
-std::shared_ptr<spdlog::logger> logger() {
-  static auto logger_ = spdlog::stdout_color_mt("ndk_echo");
-  return logger_;
-}
-} // namespace
-
-namespace {
-struct llama_model_deleter {
-  void operator()(llama_model *model) noexcept { llama_free_model(model); }
-};
-using unique_llama_model = std::unique_ptr<llama_model, llama_model_deleter>;
-
-class llama_cpp_model {
-public:
-  static llama_cpp_model load_from_file(std::string const &model_file_path,
-                                        size_t n_threads, size_t n_gpu_layers) {
-    // model
-    llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = n_gpu_layers;
-    unique_llama_model model(
-        llama_load_model_from_file(model_file_path.c_str(), model_params));
-    if (!model) {
-      throw std::runtime_error("wrong model_path: " + model_file_path);
-    }
-
-    return llama_cpp_model(std::move(model));
-  }
-
-  llama_model *get() { return model_.get(); }
-
-  /*
-std::vector<float> calc_next_token_logits(std::vector<int> const &input_ids) {
-  auto *logits_data = llama_get_logits_ith(ctx_.get(), batch.n_tokens - 1);
-  std::vector<float> logits(vocab_size_);
-  std::copy(logits_data, logits_data + vocab_size_, logits.begin());
-  return logits;
-}
-  */
-
-private:
-  llama_cpp_model(unique_llama_model &&model) : model_(std::move(model)) {
-    vocab_size_ = llama_n_vocab(model_.get());
-  }
-
-  /*
-  bool is_first(std::vector<int> const &input_ids) {
-    static std::vector<int> input_ids_before_backup = std::vector<int>();
-    std::vector<int> input_ids_before = input_ids_before_backup;
-    if (input_ids_before_backup.empty()) {
-      input_ids_before_backup = input_ids;
-      return true;
-    }
-    input_ids_before_backup = input_ids;
-    if (input_ids_before.size() > input_ids.size()) {
-      return true;
-    }
-    for (size_t i = 0; i < input_ids_before.size(); ++i) {
-      if (input_ids_before[i] != input_ids[i]) {
-        return true;
-      }
-    }
-    return false;
-  }
-  */
-
-  unique_llama_model model_;
-
-  size_t vocab_size_;
-};
-} // namespace
-
-namespace lm {
-
-using float32_t = float;
-using float16_t = uint16_t;
-
-enum class dtype_t {
-  dtype_int64,
-  dtype_float32,
-  dtype_float16,
-};
-
-constexpr size_t k_bits_per_byte = 8;
-
-class dtype_traits {
-public:
-  dtype_traits(std::string const &name, size_t size_in_bits)
-      : name_(name), size_in_bits_(size_in_bits) {}
-
-  std::string name() const { return name_; }
-  size_t size_in_bits() const { return size_in_bits_; }
-
-private:
-  std::string name_;
-  size_t size_in_bits_;
-};
-
-size_t size_in_bytes(dtype_traits const &traits) {
-  return traits.size_in_bits() / k_bits_per_byte;
-}
-
-dtype_traits get_dtype_traits(dtype_t dtype) {
-  if (dtype == dtype_t::dtype_int64) {
-    return dtype_traits("i64", 64);
-  } else if (dtype == dtype_t::dtype_float16) {
-    return dtype_traits("f16", 16);
-  } else if (dtype == dtype_t::dtype_float32) {
-    return dtype_traits("f32", 32);
-  }
-  throw std::runtime_error("not implemented dtype");
-}
-
-constexpr size_t k_max_dims = 4;
-
-template <typename T> T *pointer_cast(std::byte *data) {
-  return static_cast<T *>(static_cast<void *>(data));
-}
-template <typename T> std::byte *byte_pointer_cast(T *data) {
-  return static_cast<std::byte *>(static_cast<void *>(data));
-}
-
-class context {
-public:
-  std::byte *allocate(size_t size_in_bytes) {
-    size_t size = size_in_bytes / sizeof(std::max_align_t);
-    if (size_in_bytes % sizeof(std::max_align_t) != 0) {
-      size += 1;
-    }
-    buffers_.emplace_back(std::make_unique<std::vector<std::max_align_t>>(
-        std::vector<std::max_align_t>(size)));
-    return byte_pointer_cast(buffers_.back()->data());
-  }
-
-private:
-  std::vector<std::unique_ptr<std::vector<std::max_align_t>>> buffers_;
-};
-
-class tensor {
-public:
-  tensor(dtype_t dtype, std::array<int64_t, k_max_dims> const &n_elements,
-         std::array<size_t, k_max_dims> const &n_strides_in_bytes,
-         std::byte *data)
-      : dtype_(dtype), n_elements_(n_elements),
-        n_strides_in_bytes_(n_strides_in_bytes), data_(data) {}
-
-  std::byte *data() const { return data_; }
-
-  int64_t ne(size_t i) const { return n_elements_[i]; }
-  int64_t nb(size_t i) const { return n_strides_in_bytes_[i]; }
-
-  dtype_t dtype() const { return dtype_; }
-
-private:
-  dtype_t dtype_;
-  std::array<int64_t, k_max_dims> n_elements_;
-  std::array<size_t, k_max_dims> n_strides_in_bytes_;
-  std::byte *data_;
-};
-
-template <typename T>
-T &at(tensor const &t, int64_t ne0 = 0, int64_t ne1 = 0, int64_t ne2 = 0,
-      int64_t ne3 = 0) {
-  return *pointer_cast<T>(t.data() + ne0 * t.nb(0) + ne1 * t.nb(1) +
-                          ne2 * t.nb(2) + ne3 * t.nb(3));
-}
-
-std::string to_string(tensor const &t) {
-  return get_dtype_traits(t.dtype()).name() + " " + std::to_string(t.ne(0)) +
-         " " + std::to_string(t.ne(1)) + " " + std::to_string(t.ne(2)) + " " +
-         std::to_string(t.ne(3)) + " | " + std::to_string(t.nb(0)) + " " +
-         std::to_string(t.nb(1)) + " " + std::to_string(t.nb(2)) + " " +
-         std::to_string(t.nb(3));
-}
-
-tensor make_new_tensor_4d(context &ctx, dtype_t dtype, //
-                          int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
-  size_t dtype_size_in_bytes = size_in_bytes(get_dtype_traits(dtype));
-  std::byte *allocated_buffer =
-      ctx.allocate(dtype_size_in_bytes * ne0 * ne1 * ne2 * ne3);
-  return tensor(dtype, {ne0, ne1, ne2, ne3},
-                {dtype_size_in_bytes,             //
-                 dtype_size_in_bytes * ne0,       //
-                 dtype_size_in_bytes * ne0 * ne1, //
-                 dtype_size_in_bytes * ne0 * ne1 * ne2},
-                allocated_buffer);
-}
-
-tensor make_new_tensor_3d(context &ctx, dtype_t dtype, //
-                          int64_t ne0, int64_t ne1, int64_t ne2) {
-  return make_new_tensor_4d(ctx, dtype, ne0, ne1, ne2, 1);
-}
-
-tensor make_new_tensor_2d(context &ctx, dtype_t dtype, //
-                          int64_t ne0, int64_t ne1) {
-  return make_new_tensor_4d(ctx, dtype, ne0, ne1, 1, 1);
-}
-
-tensor make_new_tensor_1d(context &ctx, dtype_t dtype, //
-                          int64_t ne0) {
-  return make_new_tensor_4d(ctx, dtype, ne0, 1, 1, 1);
-}
-
-tensor embedding(context &ctx, tensor const &token_embed_weight,
-                 tensor const &input_ids) {
-  // embed_weight: embed_dim x vocab_size
-  // input_ids: seq_len x batch_size
-  // out: embed_dim x seq_len x batch_size
-  size_t embed_dim = token_embed_weight.ne(0);
-  size_t batch_size = input_ids.ne(1);
-  size_t seq_len = input_ids.ne(0);
-  tensor out = make_new_tensor_3d(ctx, token_embed_weight.dtype(), embed_dim,
-                                  seq_len, batch_size);
-  std::cout << to_string(out) << std::endl;
-  for (size_t bi = 0; bi < batch_size; ++bi) {
-    for (size_t pos = 0; pos < seq_len; ++pos) {
-      int64_t input_id = *pointer_cast<int64_t>(
-          input_ids.data() + bi * input_ids.nb(1) + pos * input_ids.nb(0));
-      /*
-      std::cout << input_id << " copy " << input_id * token_embed_weight.nb(1)
-                << " " << (input_id + 1) * token_embed_weight.nb(1) << " "
-                << pos * out.nb(1) + bi * out.nb(2) << std::endl;
-      */
-      std::copy(token_embed_weight.data() + input_id * token_embed_weight.nb(1),
-                token_embed_weight.data() +
-                    (input_id + 1) * token_embed_weight.nb(1),
-                out.data() + pos * out.nb(1) + bi * out.nb(2));
-    }
-  }
-  return out;
-}
-
-// tensor rope() {}
-
-tensor rms_norm(context &ctx, tensor const &x, float32_t eps) {
-  tensor out = make_new_tensor_3d(ctx, x.dtype(), x.ne(0), x.ne(1), x.ne(2));
-  for (size_t bi = 0; bi < x.ne(2); ++bi) {
-    for (size_t pos = 0; pos < x.ne(1); ++pos) {
-      float32_t sum = 0;
-      for (size_t i = 0; i < x.ne(0); ++i) {
-        sum += at<float32_t>(x, i, pos, bi) * at<float32_t>(x, i, pos, bi);
-      }
-      float32_t var = sum / out.ne(0);
-      std::cout << "var " << var << std::endl;
-      for (size_t i = 0; i < x.ne(0); ++i) {
-        at<float32_t>(out, i, pos, bi) =
-            at<float32_t>(x, i, pos, bi) / std::sqrt(var + eps);
-      }
-    }
-  }
-  return out;
-}
-
-tensor mul(context &ctx, tensor const &w, tensor const &x) {
-  tensor out = make_new_tensor_4d(ctx, x.dtype(), x.ne(0), x.ne(1), x.ne(2), x.ne(3));
-  for (size_t e3 = 0; e3 < x.ne(3); ++e3) {
-    for (size_t e2 = 0; e2 < x.ne(2); ++e2) {
-      for (size_t e1 = 0; e1 < x.ne(1); ++e1) {
-        for (size_t e0 = 0; e0 < x.ne(0); ++e0) {
-          at<float32_t>(out, e0, e1, e2, e3) =
-              at<float32_t>(w, e0 % w.ne(0), e1 % w.ne(1), e2 % w.ne(2),
-                            e3 % w.ne(3)) *
-              at<float32_t>(x, e0, e1, e2, e3);
-        }
-      }
-    }
-  }
-  return out;
-}
-
-tensor add(context &ctx, tensor const &a, tensor const &b) {
-  tensor out = make_new_tensor_4d(ctx, a.dtype(), a.ne(0), a.ne(1), a.ne(2), a.ne(3));
-  for (size_t e3 = 0; e3 < a.ne(3); ++e3) {
-    for (size_t e2 = 0; e2 < a.ne(2); ++e2) {
-      for (size_t e1 = 0; e1 < a.ne(1); ++e1) {
-        for (size_t e0 = 0; e0 < a.ne(0); ++e0) {
-          at<float32_t>(out, e0, e1, e2, e3) =
-              at<float32_t>(a, e0, e1, e2, e3) +
-              at<float32_t>(b, e0 % b.ne(0), e1 % b.ne(1), e2 % b.ne(2),
-                            e3 % b.ne(3));
-        }
-      }
-    }
-  }
-  return out;
-}
-
-tensor mul_mat(context &ctx, tensor const &a, tensor const &b) {
-  tensor out = make_new_tensor_3d(ctx, a.dtype(), a.ne(1), b.ne(1), b.ne(2), b.ne(3));
-  for (size_t e3 = 0; e3 < a.ne(3); ++e3) {
-    for (size_t e2 = 0; e2 < a.ne(2); ++e2) {
-
-      for (size_t e1 = 0; e1 < a.ne(1); ++e1) {
-        for (size_t e0 = 0; e0 < a.ne(0); ++e0) {
-          at<float32_t>(out, i, pos, bi) =
-              at<float32_t>(w, i % w.ne(0), pos % w.ne(1), bi % w.ne(2)) *
-              at<float32_t>(x, i, pos, bi);
-        }
-      }
-
-    }
-  }
-  return out;
-}
-
-tensor convert_float32_ggml_tensor_to_lm_tensor(context &ctx,
-                                                ggml_tensor const &gt) {
-  tensor out = make_new_tensor_4d(ctx, dtype_t::dtype_float32, gt.ne[0],
-                                  gt.ne[1], gt.ne[2], gt.ne[3]);
-  assert(gt.type == 0);
-  std::cout << gt.ne[0] << " " << gt.ne[1] << " " << gt.ne[2] << " " << gt.ne[3]
-            << std::endl;
-  for (size_t e3 = 0; e3 < gt.ne[3]; ++e3) {
-    for (size_t e2 = 0; e2 < gt.ne[2]; ++e2) {
-      for (size_t e1 = 0; e1 < gt.ne[1]; ++e1) {
-        for (size_t e0 = 0; e0 < gt.ne[0]; ++e0) {
-          lm::at<float32_t>(out, e0, e1, e2, e3) = *lm::pointer_cast<float32_t>(
-              static_cast<std::byte *>(gt.data) + //
-              e0 * gt.nb[0] + e1 * gt.nb[1] + e2 * gt.nb[2] + e3 * gt.nb[3]);
-        }
-      }
-    }
-  }
-  return out;
-}
-
-} // namespace lm
+#include <llama_mobile.hpp>
+#include <load_tensor_from_safetensors.hpp>
+#include <map>
 
 int main() {
-  std::cout << "hello" << std::endl;
-
   lm::context ctx;
+  std::map<std::string, lm::tensor> params_raw = lm::load_safetensors_from_file(
+      ctx, "/home/okada/Downloads/model-00001-of-00004.safetensors");
+  std::map<std::string, lm::tensor> params;
+  for (auto const &[name, param] : params_raw) {
+    std::cout << name << std::endl;
+    // std::cout << lm::to_string(lm::cast_bfloat16_to_float32(ctx, param)) <<
+    // std::endl;
+    if (param.dtype() == lm::dtype_t::dtype_float32) {
+      params.emplace(name, param);
+    } else if (param.dtype() == lm::dtype_t::dtype_bfloat16) {
+      params.emplace(name, lm::cast_bfloat16_to_float32(ctx, param));
+    } else {
+      throw std::runtime_error("unsupported dtype: " +
+                               lm::get_dtype_traits(param.dtype()).name());
+    }
+  }
 
-  size_t batch_size = 1;
-  size_t seq_len = 4;
-  size_t vocab_size = 16;
-  size_t embed_dim = 8;
-  lm::tensor token_embed_weight = lm::make_new_tensor_2d(
-      ctx, lm::dtype_t::dtype_float32, embed_dim, vocab_size);
-  std::cout << lm::to_string(token_embed_weight) << std::endl;
-  lm::tensor input_ids = lm::make_new_tensor_2d(ctx, lm::dtype_t::dtype_int64,
-                                                seq_len, batch_size);
-  at<int64_t>(input_ids, 0) = 0;
-  at<int64_t>(input_ids, 1) = 1;
-  at<int64_t>(input_ids, 2) = 2;
-  at<int64_t>(input_ids, 3) = 3;
-  std::cout << lm::to_string(input_ids) << std::endl;
-  std::cout << "(0, 0) " << at<int64_t>(input_ids, 0, 0) << std::endl;
-  std::cout << "(1, 0) " << at<int64_t>(input_ids, 1, 0) << std::endl;
-  std::cout << "(2, 0) " << at<int64_t>(input_ids, 2, 0) << std::endl;
-  std::cout << "(3, 0) " << at<int64_t>(input_ids, 3, 0) << std::endl;
+  lm::float32_t eps = 1e-5;
+  int64_t num_attention_heads = 32;
+  int64_t num_key_value_heads = 8;
+  int64_t head_dim = 128;
+  int64_t hidden_size = 4096;
+  lm::float32_t rope_theta = 500000;
+
+  int64_t batch_size = 1;
+  int64_t seq_len = 4;
+  int64_t vocab_size = 16;
+  int64_t embed_dim = 8;
+  lm::tensor input_ids =
+      lm::make_new_tensor(ctx, lm::dtype_t::dtype_int64, seq_len, batch_size);
+  lm::at<int64_t>(input_ids, 0) = 0;
+  lm::at<int64_t>(input_ids, 1) = 1;
+  lm::at<int64_t>(input_ids, 2) = 2;
+  lm::at<int64_t>(input_ids, 3) = 3;
+
+  lm::tensor token_embed_weight = params["model.embed_tokens.weight"];
+  std::cout << "token_embed_weight " << lm::to_string(token_embed_weight)
+            << std::endl;
+
+  lm::tensor hidden_state = lm::embedding(ctx, token_embed_weight, input_ids);
+  std::cout << "hidden_state " << lm::to_string(hidden_state) << std::endl;
+
+  for (size_t i = 0; i < 1; ++i) {
+    lm::tensor residual = lm::copy_contiguous(ctx, hidden_state);
+    lm::tensor input_layer_norm_weight =
+        params["model.layers.0.input_layernorm.weight"];
+    hidden_state = rms_norm(ctx, hidden_state, eps);
+    hidden_state = mul(ctx, hidden_state, input_layer_norm_weight);
+    std::cout << "hidden_state " << lm::to_string(hidden_state) << std::endl;
+
+    // self att
+    lm::tensor wq = params["model.layers.0.self_attn.q_proj.weight"];
+    std::cout << "wq " << lm::to_string(wq) << std::endl;
+    lm::tensor q = mul_mat(ctx, wq, hidden_state);
+    std::cout << "q " << lm::to_string(q) << std::endl;
+
+    lm::tensor wk = params["model.layers.0.self_attn.k_proj.weight"];
+    std::cout << "wk " << lm::to_string(wk) << std::endl;
+    lm::tensor k = mul_mat(ctx, wk, hidden_state);
+    std::cout << "k " << lm::to_string(k) << std::endl;
+
+    lm::tensor wv = params["model.layers.0.self_attn.v_proj.weight"];
+    std::cout << "wv " << lm::to_string(wv) << std::endl;
+    lm::tensor v = mul_mat(ctx, wv, hidden_state);
+    std::cout << "v " << lm::to_string(v) << std::endl;
+
+    q = lm::copy_contiguous(
+        ctx, q.reshape({head_dim, num_attention_heads, seq_len, batch_size})
+                 .transpose({0, 2, 1, 3}));
+    k = lm::copy_contiguous(
+        ctx, k.reshape({head_dim, num_key_value_heads, seq_len, batch_size})
+                 .transpose({0, 2, 1, 3}));
+    /*
+    v = lm::copy_contiguous(
+        ctx, v.reshape({head_dim, num_key_value_heads, seq_len, batch_size})
+                 .transpose({2, 0, 1, 3}));
+    */
+    v = lm::copy_contiguous(
+        ctx, v.reshape({head_dim, num_key_value_heads, seq_len, batch_size})
+                 .transpose({2, 0, 1, 3}));
+    std::cout << "q_rt " << lm::to_string(q) << std::endl;
+    std::cout << "k_rt " << lm::to_string(k) << std::endl;
+    std::cout << "v_rt " << lm::to_string(v) << std::endl;
+
+    auto check = [](lm::tensor const& t, std::string const& gt_file_path) {
+        std::ifstream ifs(gt_file_path);
+        std::vector<float> gt;
+        std::copy(std::istream_iterator<float>(ifs), std::istream_iterator<float>(), std::back_inserter(gt));
+        std::cout << "gt.size " << gt.size() << std::endl;
+        for(size_t i = 0; i < gt.size(); ++i) {
+            float val = *(lm::pointer_cast<float>(t.data()) + i);
+            if(std::pow(val - gt[i], 2) > 1e-6) {
+                std::cout << i << " " << val << " != " << gt[i] << std::endl;
+            }
+            else {
+                std::cout << i << " ok" << std::endl;
+            }
+        }
+    };
+
+    lm::tensor position_ids =
+        lm::make_new_tensor(ctx, lm::dtype_t::dtype_float32, seq_len, 1);
+    for (size_t i = 0; i < seq_len; ++i) {
+      lm::at<lm::float32_t>(position_ids, i) = i;
+    }
+    lm::float32_t base = 500000;
+    auto [query_embed, key_embed] =
+        lm::rope(ctx, position_ids, base, head_dim, q, k);
+    //query_embed = lm::copy_contiguous(ctx, query_embed);
+    //query_embed = lm::copy_contiguous(ctx, query_embed.reshape({128, 4, 4, 8}).transpose({0, 1, 3, 2})).reshape({128, 4, 32});
+    std::cout << "query_embed " << lm::to_string(query_embed) << std::endl;
+    //check(query_embed, "/home/okada/android_llama_cpp/llama-mobile/check/query_embed.txt");
+    std::cout << "key_embed " << lm::to_string(key_embed) << std::endl;
+    //check(key_embed, "/home/okada/android_llama_cpp/llama-mobile/check/key_embed.txt");
+
+    /*
+    lm::tensor attn_weights =
+        lm::div(ctx, lm::mul_mat(ctx, query_embed, key_embed),
+                lm::make_new_scalar(ctx, lm::dtype_t::dtype_float32,
+                                    std::sqrt(head_dim)));
+    */
+    lm::tensor attn_weights =
+        lm::div(ctx, lm::mul_mat(ctx, key_embed, query_embed),
+                lm::make_new_scalar(ctx, lm::dtype_t::dtype_float32,
+                                    std::sqrt(head_dim)));
+    std::cout << "(kq) attn_weights " << lm::to_string(attn_weights)
+              << std::endl;
+
+    check(attn_weights, "/home/okada/android_llama_cpp/llama-mobile/check/attn_weight.txt");
+    std::cout << "===" << std::endl;
+    return 0;
+
+    // attn_weights = lm::apply_causal_mask(ctx, attn_weights.transpose({1, 0,
+    // 2, 3}));
+    attn_weights = lm::apply_causal_mask(ctx, attn_weights);
+    attn_weights = softmax(ctx, attn_weights, 1.0e-8);
+    std::cout << "(softmax qk) softmax attn_weights "
+              << lm::to_string(attn_weights) << std::endl;
+    hidden_state = mul_mat(ctx, v, attn_weights);
+    /*
+    hidden_state =
+        lm::copy_contiguous(ctx, hidden_state.transpose({1, 2, 0, 3}));
+    hidden_state.reshape({hidden_size, seq_len, batch_size});
+    */
+    hidden_state =
+        lm::copy_contiguous(ctx, hidden_state.transpose({0, 2, 1, 3}));
+    /*
+    hidden_state =
+        lm::copy_contiguous(ctx, hidden_state.transpose({2, 0, 1, 3}));
+    */
+    hidden_state.reshape({hidden_size, seq_len, batch_size});
+    std::cout << "(attn_weights x v) hidden_state "
+              << lm::to_string(hidden_state) << std::endl;
+
+    for (int64_t e0 = 0; e0 < hidden_state.ne(0); ++e0) {
+      std::cout << int(100 * at<lm::float32_t>(hidden_state, e0, 0, 0, 0))
+                << ", ";
+    }
+    std::cout << std::endl;
+
+    lm::tensor wo = params["model.layers.0.self_attn.o_proj.weight"];
+    std::cout << "wo " << lm::to_string(wo) << std::endl;
+    // hidden_state = mul_mat(ctx, wo.transpose({1, 0, 2, 3}), hidden_state);
+    hidden_state = mul_mat(ctx, wo, hidden_state);
+    std::cout << "o " << lm::to_string(hidden_state) << std::endl;
+    return 0;
+
+    hidden_state = lm::add(ctx, hidden_state, residual);
+    std::cout << "hidden_state " << lm::to_string(hidden_state) << std::endl;
+
+    lm::tensor residual2 = lm::copy_contiguous(ctx, hidden_state);
+    lm::tensor post_attn_layer_norm_weight =
+        params["model.layers.0.post_attention_layernorm.weight"];
+    hidden_state = rms_norm(ctx, hidden_state, eps);
+    hidden_state = mul(ctx, hidden_state, post_attn_layer_norm_weight);
+    std::cout << "hidden_state " << lm::to_string(hidden_state) << std::endl;
+    // mlp
+    lm::tensor ffn_gate = params["model.layers.0.mlp.gate_proj.weight"];
+    lm::tensor ffn_down = params["model.layers.0.mlp.down_proj.weight"];
+    lm::tensor ffn_up = params["model.layers.0.mlp.up_proj.weight"];
+    lm::tensor gate = mul_mat(ctx, ffn_gate, hidden_state);
+    std::cout << "gate hidden_state " << lm::to_string(gate) << std::endl;
+    // gate = act(ctx, gate);
+    lm::tensor up = mul_mat(ctx, ffn_up, hidden_state);
+    std::cout << "up hidden_state " << lm::to_string(up) << std::endl;
+    hidden_state = mul(ctx, up, gate);
+    lm::tensor down = mul_mat(ctx, ffn_down, hidden_state);
+    hidden_state = lm::add(ctx, hidden_state, residual2);
+    std::cout << "last hidden_state " << lm::to_string(hidden_state)
+              << std::endl;
+  }
+
   /*
-  lm::tensor embd_inp = embedding(ctx, token_embed_weight, input_ids);
-  std::cout << lm::to_string(embd_inp) << std::endl;
-  */
-
-  std::string model_file_path =
-      "/home/okada/storage/sandman_llm_train/pipeline_out/hoge-wf/"
-      "convert_to_gguf/model.gguf";
-  //"quantized_model.gguf";
-  int n_gpu_layers = 0;
-  auto model =
-      llama_cpp_model::load_from_file(model_file_path, 1, n_gpu_layers);
-  std::cout << model.get()->tok_embd->name << std::endl;
-  std::cout << model.get()->tok_embd->type << std::endl;
-  lm::tensor tok_embd =
-      lm::convert_float32_ggml_tensor_to_lm_tensor(ctx, *model.get()->tok_embd);
-  std::cout << lm::at<lm::float32_t>(tok_embd, 0) << std::endl;
-  std::cout << lm::at<lm::float32_t>(tok_embd, 1) << std::endl;
-
-  std::cout << "\n";
-
-  std::cout << lm::to_string(tok_embd) << std::endl;
-  lm::tensor embd_inp2 = embedding(ctx, tok_embd, input_ids);
-  std::cout << lm::to_string(embd_inp2) << std::endl;
-  std::cout << lm::at<lm::float32_t>(embd_inp2, 0) << std::endl;
-  std::cout << lm::at<lm::float32_t>(embd_inp2, 1) << std::endl;
-  std::cout << lm::at<lm::float32_t>(embd_inp2, 2) << std::endl;
-  std::cout << lm::at<lm::float32_t>(embd_inp2, 3) << std::endl;
-  std::cout << lm::at<lm::float32_t>(embd_inp2, 4) << std::endl;
-  std::cout << lm::at<lm::float32_t>(embd_inp2, 5) << std::endl;
-
-  lm::float32_t eps = 0.01;
-  lm::tensor norm_inp = rms_norm(ctx, embd_inp2, eps);
-  std::cout << lm::to_string(norm_inp) << std::endl;
-  std::cout << lm::at<lm::float32_t>(norm_inp, 0) << std::endl;
-  std::cout << lm::at<lm::float32_t>(norm_inp, 1) << std::endl;
-  std::cout << lm::at<lm::float32_t>(norm_inp, 2) << std::endl;
-  std::cout << lm::at<lm::float32_t>(norm_inp, 3) << std::endl;
-  /*
-
-  // llama_backend_init();
-  // llama_numa_init(GGML_NUMA_STRATEGY_DISABLED);
-
-  std::string model_file_path =
-      "/home/okada/android_llama_cpp/cordova-plugin-ndk-echo/data/"
-      "quantized_model.gguf";
-  int n_gpu_layers = 99;
-  auto model =
-      llama_cpp_model::load_from_file(model_file_path, 1, n_gpu_layers);
-  std::cout << "layers.size() " << model.get()->layers.size() << std::endl;
-  std::cout << model.get()->output_norm->name << std::endl;
-  std::cout << model.get()->tok_embd->name << std::endl;
-  std::cout << model.get()->tok_embd->ne[0] << std::endl;
-  std::cout << model.get()->tok_embd->ne[1] << std::endl;
-  std::cout << model.get()->tok_embd->ne[2] << std::endl;
-  std::cout << model.get()->tok_embd->ne[3] << std::endl;
-  std::cout << model.get()->tok_embd->nb[0] << std::endl;
-  std::cout << model.get()->tok_embd->nb[1] << std::endl;
-  std::cout << model.get()->tok_embd->nb[2] << std::endl;
-  std::cout << model.get()->tok_embd->nb[3] << std::endl;
-
-  //embedding(model.get()->tok_embd, input_ids);
-  size_t vocab_size = model.get()->tok_embd->ne[1];
-  lm::tensor input_ids(lm::dtype_t::dtype_int32, {vocab_size, 1, 1, 1},
-  {sizeof(int32_t), 1, 1, 1}, nullptr);
+  lm::tensor output_norm_weight = lm::tensor ffn_gate =
+  params["model.layers.0.mlp.gate_proj.weight"]; hidden_state = rms_norm(ctx,
+  hidden_state, eps); hidden_state = mul(ctx, hidden_state, output_norm_weight);
+  std::cout << "rms_norm " << lm::to_string(hidden_state) << std::endl;
   */
 }
