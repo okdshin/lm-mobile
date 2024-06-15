@@ -119,12 +119,6 @@ int main() {
     std::cout << "key_embed " << lm::to_string(key_embed) << std::endl;
     //check(key_embed, "/home/okada/android_llama_cpp/llama-mobile/check/key_embed.txt");
 
-    /*
-    lm::tensor attn_weights =
-        lm::div(ctx, lm::mul_mat(ctx, query_embed, key_embed),
-                lm::make_new_scalar(ctx, lm::dtype_t::dtype_float32,
-                                    std::sqrt(head_dim)));
-    */
     lm::tensor attn_weights =
         lm::div(ctx, lm::mul_mat(ctx, key_embed, query_embed),
                 lm::make_new_scalar(ctx, lm::dtype_t::dtype_float32,
@@ -132,17 +126,16 @@ int main() {
     std::cout << "(kq) attn_weights " << lm::to_string(attn_weights)
               << std::endl;
 
-    check(attn_weights, "/home/okada/android_llama_cpp/llama-mobile/check/attn_weight.txt");
-    std::cout << "===" << std::endl;
-    return 0;
-
     // attn_weights = lm::apply_causal_mask(ctx, attn_weights.transpose({1, 0,
     // 2, 3}));
     attn_weights = lm::apply_causal_mask(ctx, attn_weights);
     attn_weights = softmax(ctx, attn_weights, 1.0e-8);
     std::cout << "(softmax qk) softmax attn_weights "
               << lm::to_string(attn_weights) << std::endl;
+    //check(attn_weights, "/home/okada/android_llama_cpp/llama-mobile/check/attn_weight.txt");
+
     hidden_state = mul_mat(ctx, v, attn_weights);
+    //check(hidden_state, "/home/okada/android_llama_cpp/llama-mobile/check/attn_weight_x_v.txt");
     /*
     hidden_state =
         lm::copy_contiguous(ctx, hidden_state.transpose({1, 2, 0, 3}));
@@ -169,7 +162,7 @@ int main() {
     // hidden_state = mul_mat(ctx, wo.transpose({1, 0, 2, 3}), hidden_state);
     hidden_state = mul_mat(ctx, wo, hidden_state);
     std::cout << "o " << lm::to_string(hidden_state) << std::endl;
-    return 0;
+    //check(hidden_state, "/home/okada/android_llama_cpp/llama-mobile/check/attn_output.txt");
 
     hidden_state = lm::add(ctx, hidden_state, residual);
     std::cout << "hidden_state " << lm::to_string(hidden_state) << std::endl;
@@ -194,6 +187,9 @@ int main() {
     hidden_state = lm::add(ctx, hidden_state, residual2);
     std::cout << "last hidden_state " << lm::to_string(hidden_state)
               << std::endl;
+    check(hidden_state, "/home/okada/android_llama_cpp/llama-mobile/check/down_proj.txt");
+    std::cout << "===" << std::endl;
+    return 0;
   }
 
   /*
